@@ -247,6 +247,9 @@ class SamplingParams(
     # Fields used for bad words
     bad_words: Optional[list[str]] = None
     _bad_words_token_ids: Optional[list[list[int]]] = None
+    
+    # Field used for hidden states extraction
+    prefill_hidden_layer: Optional[int] = None
 
     @staticmethod
     def from_optional(
@@ -280,6 +283,7 @@ class SamplingParams(
         logit_bias: Optional[Union[dict[int, float], dict[str, float]]] = None,
         allowed_token_ids: Optional[list[int]] = None,
         extra_args: Optional[dict[str, Any]] = None,
+        prefill_hidden_layer: Optional[int] = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -322,6 +326,7 @@ class SamplingParams(
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
             extra_args=extra_args,
+            prefill_hidden_layer=prefill_hidden_layer,
         )
 
     def __post_init__(self) -> None:

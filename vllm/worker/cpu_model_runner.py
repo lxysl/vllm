@@ -453,6 +453,11 @@ class CPUModelRunnerBase(ModelRunnerBase[TModelInputForCPU]):
         self.is_driver_worker = is_driver_worker
         self.return_hidden_states = return_hidden_states
 
+        # Hidden states extraction
+        self._target_layer = None
+        self._captured_hidden = None
+        self._hook_handle = None
+
         self.device = self.device_config.device
         self.pin_memory = False
 
@@ -511,6 +516,40 @@ class CPUModelRunnerBase(ModelRunnerBase[TModelInputForCPU]):
 
     def get_model(self) -> nn.Module:
         return self.model
+
+    def _register_hidden_hook(self, layer_idx: int):
+        """Register a forward hook to capture hidden states from specified layer."""
+        # Try to find the layer list in common model structures
+        candidates = ["model.layers", "layers", "transformer.h", "transformer.layers"]
+        layer_list = None
+        
+        for cand in candidates:
+            obj = self.model
+            for tok in cand.split("."):
+                if hasattr(obj, tok):
+                    obj = getattr(obj, tok)
+                else:
+                    obj = None
+                    break
+            if isinstance(obj, (list, torch.nn.ModuleList)) and len(obj) > layer_idx:
+                layer_list = obj
+                break
+        
+        if layer_list is None:
+            logger.warning(f"Could not find layer list in model for layer {layer_idx}")
+            return
+            
+        target_layer = layer_list[layer_idx]
+        self._target_layer = layer_idx
+        
+        def hook(module, input, output):
+            # output might be a tensor or tuple; take the first item if tuple
+            if isinstance(output, tuple):
+                self._captured_hidden = output[0].detach().clone()
+            else:
+                self._captured_hidden = output.detach().clone()
+        
+        self._hook_handle = target_layer.register_forward_hook(hook)
 
     def _prepare_model_input_tensors(
         self,
@@ -637,6 +676,34 @@ class CPUModelRunner(CPUModelRunnerBase[ModelInputForCPUWithSamplingMetadata]):
             execute_model_kwargs.update(
                 {"previous_hidden_states": previous_hidden_states})
 
+        # Check if we need to capture hidden states for specific layer
+        capture_layer_idx = None
+        is_prefill = model_input.is_prompt
+        if is_prefill and model_input.sampling_metadata:
+            for sg in model_input.sampling_metadata.seq_groups:
+                if sg.sampling_params.prefill_hidden_layer is not None:
+                    layer_idx = sg.sampling_params.prefill_hidden_layer
+                    # Validate layer index
+                    num_layers = self.model_config.get_num_layers(self.parallel_config)
+                    if layer_idx < 0 or layer_idx >= num_layers:
+                        raise ValueError(
+                            f"prefill_hidden_layer {layer_idx} is out of range "
+                            f"[0, {num_layers}). Model has {num_layers} layers."
+                        )
+                    capture_layer_idx = layer_idx
+                    break
+        
+        # Register hook if needed
+        if capture_layer_idx is not None:
+            self._captured_hidden = None
+            # Avoid re-registering hook for the same layer
+            if self._target_layer != capture_layer_idx:
+                if self._hook_handle is not None:
+                    self._hook_handle.remove()
+                    self._hook_handle = None
+                self._register_hidden_hook(capture_layer_idx)
+                self._target_layer = capture_layer_idx
+
         with set_forward_context(model_input.attn_metadata, self.vllm_config,
                                  model_input.virtual_engine):
             hidden_states = model_executable(
@@ -665,6 +732,18 @@ class CPUModelRunner(CPUModelRunnerBase[ModelInputForCPUWithSamplingMetadata]):
             if model_input.is_prompt:
                 output.prefill_hidden_states = hidden_states
             output.hidden_states = hidden_states
+
+        # Handle custom hidden states from hook for specific layer
+        if capture_layer_idx is not None and self._captured_hidden is not None:
+            # Only store for prefill, and overwrite prefill_hidden_states if captured
+            if model_input.is_prompt:
+                output.prefill_hidden_states = self._captured_hidden
+                # Clean up the hook and captured data
+                if self._hook_handle is not None:
+                    self._hook_handle.remove()
+                    self._hook_handle = None
+                self._captured_hidden = None
+
         return [output]
 
     def generate_proposals(self, *args, **kwargs):

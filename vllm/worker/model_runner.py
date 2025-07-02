@@ -1081,6 +1081,11 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.is_driver_worker = is_driver_worker
         self.return_hidden_states = return_hidden_states
 
+        # Hidden states extraction
+        self._target_layer = None
+        self._captured_hidden = None
+        self._hook_handle = None
+
         self.device = self.device_config.device
         self.pin_memory = is_pin_memory_available()
 
@@ -1223,6 +1228,50 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
 
     def get_model(self) -> nn.Module:
         return self.model
+
+    def _register_hidden_hook(self, layer_idx: int):
+        """Register a forward hook to capture hidden states from specified layer."""
+        # Try to find the layer list in common model structures
+        candidates = ["model.layers", "layers", "transformer.h", "transformer.layers"]
+        layer_list = None
+        
+        for cand in candidates:
+            obj = self.model
+            for tok in cand.split("."):
+                if hasattr(obj, tok):
+                    obj = getattr(obj, tok)
+                else:
+                    obj = None
+                    break
+            if isinstance(obj, (list, torch.nn.ModuleList)) and len(obj) > layer_idx:
+                layer_list = obj
+                break
+        
+        if layer_list is None or layer_idx >= len(layer_list):
+            logger.warning("Cannot find layer %d to capture hidden states. "
+                         "Available layers: %d", layer_idx, 
+                         len(layer_list) if layer_list else 0)
+            return
+        
+        # Remove previous hook if exists
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+        
+        def hook(module, input, output):
+            # output might be a tensor or tuple; take the first item if tuple
+            if isinstance(output, tuple):
+                self._captured_hidden = output[0].detach().clone()
+            else:
+                self._captured_hidden = output.detach().clone()
+            
+            # Move to CPU to reduce GPU memory usage if needed
+            # Users can set this via environment variable if they want CPU storage
+            import os
+            if os.getenv("VLLM_HIDDEN_STATES_TO_CPU", "false").lower() == "true":
+                self._captured_hidden = self._captured_hidden.cpu()
+        
+        self._hook_handle = layer_list[layer_idx].register_forward_hook(hook)
+        logger.info("Registered hidden state hook at layer %d", layer_idx)
 
     def save_sharded_state(
         self,
@@ -1838,6 +1887,28 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
 
+        # Check if we need to capture hidden states for specific layer
+        capture_layer_idx = None
+        is_prefill = model_input.is_prompt
+        if is_prefill and model_input.sampling_metadata:
+            for sg in model_input.sampling_metadata.seq_groups:
+                if sg.sampling_params.prefill_hidden_layer is not None:
+                    layer_idx = sg.sampling_params.prefill_hidden_layer
+                    # Validate layer index
+                    num_layers = self.model_config.get_num_layers(self.parallel_config)
+                    if layer_idx < 0 or layer_idx >= num_layers:
+                        raise ValueError(
+                            f"prefill_hidden_layer {layer_idx} is out of range "
+                            f"[0, {num_layers}). Model has {num_layers} layers."
+                        )
+                    capture_layer_idx = layer_idx
+                    break
+        
+        # Register hook if needed
+        if capture_layer_idx is not None:
+            self._captured_hidden = None
+            self._register_hidden_hook(capture_layer_idx)
+
         if not bypass_model_exec:
             with set_forward_context(model_input.attn_metadata,
                                      self.vllm_config, virtual_engine):
@@ -1962,6 +2033,17 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 hidden_states = hidden_or_intermediate_states
 
             output.hidden_states = hidden_states
+
+        # Handle custom hidden states from hook for specific layer
+        if capture_layer_idx is not None and self._captured_hidden is not None:
+            # Only store for prefill, and overwrite prefill_hidden_states if captured
+            if model_input.is_prompt:
+                output.prefill_hidden_states = self._captured_hidden
+                # Clean up the hook and captured data
+                if self._hook_handle is not None:
+                    self._hook_handle.remove()
+                    self._hook_handle = None
+                self._captured_hidden = None
 
         return [output]
 
